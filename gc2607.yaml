@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: CC0-1.0
+# GC2607 sensor tuning for libcamera SoftISP
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 16
+  - Awb:
+  - Adjust:
+  - Agc:
+...

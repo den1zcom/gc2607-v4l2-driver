@@ -19,6 +19,7 @@
 #include <media/v4l2-device.h>
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-async.h>
+#include <media/v4l2-rect.h>
 
 #define GC2607_CHIP_ID_H		0x26
 #define GC2607_CHIP_ID_L		0x07
@@ -54,8 +55,16 @@
 #define GC2607_LINK_FREQ		336000000LL  /* 672 Mbps / 2 lanes */
 #define GC2607_HTS			2048
 #define GC2607_VTS			2003  /* 1.5x from 1335 for 1.5x exposure (20 FPS) */
+#define GC2607_VTS_MIN			1335  /* Minimum VTS for 30fps */
+#define GC2607_VTS_MAX			8191  /* Maximum VTS (13-bit) */
 #define GC2607_WIDTH			1920
 #define GC2607_HEIGHT			1080
+
+/* Blanking */
+#define GC2607_HBLANK			(GC2607_HTS - GC2607_WIDTH)  /* 128 */
+#define GC2607_VBLANK_DEFAULT		(GC2607_VTS - GC2607_HEIGHT) /* 923 */
+#define GC2607_VBLANK_MIN		(GC2607_VTS_MIN - GC2607_HEIGHT) /* 255 */
+#define GC2607_VBLANK_MAX		(GC2607_VTS_MAX - GC2607_HEIGHT) /* 7111 */
 
 /* Register value pair for initialization sequences */
 struct gc2607_regval {
@@ -118,6 +127,8 @@ struct gc2607 {
 	struct v4l2_ctrl *pixel_rate;
 	struct v4l2_ctrl *exposure;
 	struct v4l2_ctrl *gain;
+	struct v4l2_ctrl *vblank;
+	struct v4l2_ctrl *hblank;
 
 	/* Power management resources (provided by INT3472 PMIC) */
 	struct clk *xclk;		/* Master clock (typically 19.2 MHz) */
@@ -256,7 +267,7 @@ static const struct gc2607_regval gc2607_1080p_30fps_regs[] = {
 	{0x0af4, 0x2b},
 	{0x0002, 0x30},
 	{0x00c3, 0x3c},
-	{0x0101, 0x00},
+	{0x0101, 0x03},  /* H+V flip (180° rotation, sensor mounted upside down) */
 	{0x0d05, 0xcc},
 	{0x0218, 0x00},
 	{0x005e, 0x84},
@@ -560,11 +571,31 @@ static int gc2607_set_fmt(struct v4l2_subdev *sd,
 	return 0;
 }
 
+static int gc2607_get_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *sd_state,
+				struct v4l2_subdev_selection *sel)
+{
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+		sel->r.top = 0;
+		sel->r.left = 0;
+		sel->r.width = GC2607_WIDTH;
+		sel->r.height = GC2607_HEIGHT;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
 static const struct v4l2_subdev_pad_ops gc2607_pad_ops = {
 	.enum_mbus_code = gc2607_enum_mbus_code,
 	.enum_frame_size = gc2607_enum_frame_size,
 	.get_fmt = gc2607_get_fmt,
 	.set_fmt = gc2607_set_fmt,
+	.get_selection = gc2607_get_selection,
 };
 
 /*
@@ -637,6 +668,19 @@ static int gc2607_s_ctrl(struct v4l2_ctrl *ctrl)
 			dev_dbg(&client->dev, "Set exposure to %d\n", ctrl->val);
 		break;
 
+	case V4L2_CID_VBLANK: {
+		/* Update VTS = height + vblank */
+		u16 vts = GC2607_HEIGHT + ctrl->val;
+
+		ret = gc2607_write_reg(gc2607, 0x0220, (vts >> 8) & 0xff);
+		if (ret)
+			break;
+		ret = gc2607_write_reg(gc2607, 0x0221, vts & 0xff);
+		if (!ret)
+			dev_dbg(&client->dev, "Set VTS to %u\n", vts);
+		break;
+	}
+
 	case V4L2_CID_ANALOGUE_GAIN:
 		/* Always use the calibrated LUT for optimal noise performance.
 		 * ctrl->val is LUT index (0-16), not raw register value.
@@ -682,6 +726,31 @@ static const struct v4l2_subdev_video_ops gc2607_video_ops = {
 static const struct v4l2_subdev_ops gc2607_subdev_ops = {
 	.video = &gc2607_video_ops,
 	.pad = &gc2607_pad_ops,
+};
+
+/*
+ * Initialize subdev state with default format.
+ * Required by kernel 6.x+ which reads format from state directly.
+ */
+static int gc2607_init_state(struct v4l2_subdev *sd,
+			     struct v4l2_subdev_state *state)
+{
+	struct v4l2_mbus_framefmt *fmt;
+
+	fmt = v4l2_subdev_state_get_format(state, 0);
+	if (fmt) {
+		fmt->width = GC2607_WIDTH;
+		fmt->height = GC2607_HEIGHT;
+		fmt->code = MEDIA_BUS_FMT_SGRBG10_1X10;
+		fmt->field = V4L2_FIELD_NONE;
+		fmt->colorspace = V4L2_COLORSPACE_RAW;
+	}
+
+	return 0;
+}
+
+static const struct v4l2_subdev_internal_ops gc2607_internal_ops = {
+	.init_state = gc2607_init_state,
 };
 
 /*
@@ -832,6 +901,7 @@ static int gc2607_probe(struct i2c_client *client)
 
 	/* Initialize V4L2 subdev */
 	v4l2_i2c_subdev_init(&gc2607->sd, client, &gc2607_subdev_ops);
+	gc2607->sd.internal_ops = &gc2607_internal_ops;
 	gc2607->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
 
 	/* Initialize media pad */
@@ -844,7 +914,7 @@ static int gc2607_probe(struct i2c_client *client)
 	}
 
 	/* Initialize control handler with V4L2 controls */
-	v4l2_ctrl_handler_init(&gc2607->ctrls, 4);
+	v4l2_ctrl_handler_init(&gc2607->ctrls, 8);
 
 	/* Link frequency control (required by IPU6) */
 	gc2607->link_freq = v4l2_ctrl_new_int_menu(&gc2607->ctrls,
@@ -884,6 +954,37 @@ static int gc2607_probe(struct i2c_client *client)
 					  GC2607_GAIN_MAX,
 					  GC2607_GAIN_STEP,
 					  GC2607_GAIN_DEFAULT);
+
+	/* VBLANK control (required by libcamera) */
+	gc2607->vblank = v4l2_ctrl_new_std(&gc2607->ctrls,
+					    &gc2607_ctrl_ops,
+					    V4L2_CID_VBLANK,
+					    GC2607_VBLANK_MIN,
+					    GC2607_VBLANK_MAX,
+					    1,
+					    GC2607_VBLANK_DEFAULT);
+
+	/* HBLANK control (read-only, required by libcamera) */
+	gc2607->hblank = v4l2_ctrl_new_std(&gc2607->ctrls,
+					    NULL,
+					    V4L2_CID_HBLANK,
+					    GC2607_HBLANK,
+					    GC2607_HBLANK,
+					    1,
+					    GC2607_HBLANK);
+	if (gc2607->hblank)
+		gc2607->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+
+	/* Camera orientation (required by libcamera) */
+	v4l2_ctrl_new_std_menu(&gc2607->ctrls, NULL,
+			       V4L2_CID_CAMERA_ORIENTATION,
+			       V4L2_CAMERA_ORIENTATION_EXTERNAL,
+			       0, V4L2_CAMERA_ORIENTATION_FRONT);
+
+	/* Sensor rotation (required by libcamera) - 0 degrees since H+V flip is in HW */
+	v4l2_ctrl_new_std(&gc2607->ctrls, NULL,
+			  V4L2_CID_CAMERA_SENSOR_ROTATION,
+			  0, 0, 1, 0);
 
 	gc2607->sd.ctrl_handler = &gc2607->ctrls;
 
@@ -932,7 +1033,7 @@ static int gc2607_probe(struct i2c_client *client)
 	dev_info(dev, "GC2607 probe successful\n");
 	dev_info(dev, "  I2C address: 0x%02x\n", client->addr);
 	dev_info(dev, "  I2C adapter: %s\n", client->adapter->name);
-	dev_info(dev, "  Format: SGRBG10 %ux%u@%ufps\n",
+	dev_info(dev, "  Format: SGRBG10 %ux%u@%ufps (H+V flipped)\n",
 		 gc2607->cur_mode->width, gc2607->cur_mode->height,
 		 gc2607->cur_mode->max_fps);
 
